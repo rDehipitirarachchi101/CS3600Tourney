@@ -51,7 +51,10 @@ def apply_seccomp():
 
     import prctl
 
-    prctl.set_ptracer(None)
+    try:
+        prctl.set_ptracer(None)
+    except OSError:
+        pass  # PR_SET_PTRACER unavailable without Yama LSM — non-fatal
     prctl.set_no_new_privs(True)
     ctx = seccomp.SyscallFilter(defaction=seccomp.ALLOW)
     # filesystem
@@ -213,6 +216,33 @@ def run_player_process(
         resource.setrlimit(
             resource.RLIMIT_RSS, (limit_bytes, limit_bytes)
         )  # only allow current process to run
+
+        # Pre-import heavy libraries before seccomp so their initialization
+        # syscalls (AF_UNIX sockets, shared memory, etc.) happen outside the
+        # sandbox. Any subsequent import in a bot is a free sys.modules cache hit.
+        for _mod in ("jax", "jax.numpy", "torch", "numpy"):
+            try:
+                __import__(_mod)
+            except ImportError:
+                pass
+
+        # JAX/XLA and PyTorch initialize their runtimes lazily on the first
+        # computation, not on import. That initialization calls setsockopt/
+        # sendmsg/recvmsg on internal Unix sockets — all blocked by seccomp.
+        # Force both runtimes to fully initialize here, before the sandbox.
+        try:
+            import jax.numpy as _jnp
+            _x = _jnp.zeros((4, 4)) @ _jnp.zeros((4, 4))
+            _x.block_until_ready()
+            del _jnp, _x
+        except Exception:
+            pass
+        try:
+            import torch as _torch
+            _x = _torch.zeros(4, 4) @ _torch.zeros(4, 4)
+            del _torch, _x
+        except Exception:
+            pass
 
         drop_priveliges(user_name, group_name)
         apply_seccomp()
