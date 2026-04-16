@@ -3,42 +3,40 @@ from typing import List, Tuple
 from collections import deque
 
 from game import board, move, enums
-from game.enums import Cell, CARPET_POINTS_TABLE, MoveType
+from game.enums import Cell, CARPET_POINTS_TABLE, MoveType, Direction, loc_after_direction
 from .rat_belief import RatBelief
 
 
 # ---------------------------------------------------------------------------
-# Tunable weights (v4 base + targeted fixes)
+# Tunable weights
 # ---------------------------------------------------------------------------
-W_CARPET_POTENTIAL  = 1.4
+W_CARPET_POTENTIAL  = 1.4    # weight for global carpet potential
 W_RAT_EV            = 0.4
 W_PRIMED_OWNED      = 0.3
 W_MOBILITY          = 0.1
+W_LONG_LINE_BONUS   = 0.5    # bonus per primed-run length >= 3 near us
 
-# Oscillation (applied at root only)
-W_OSCILLATION       = 25.0
-W_OSCILLATION_2     = 18.0
-W_OSCILLATION_3     = 10.0
-W_REVISIT           = 5.0
+# Oscillation (applied at root only now)
+W_OSCILLATION       = 25.0   # A→B→A
+W_OSCILLATION_2     = 18.0   # A→B→C→A
+W_OSCILLATION_3     = 10.0   # A→B→C→D→A
+W_REVISIT           = 5.0    # per visit in last 6 turns
 
-SEARCH_COOLDOWN     = 5      # fix: was 3, longer cooldown
-SEARCH_EV_THRESHOLD = 3.0    # fix: was 0, only search when very confident
-NO_SEARCH_TURNS     = 18     # fix: no searching first 18 turns
-TIME_BUFFER         = 5.0    # fix: was 2.0, safe buffer
+SEARCH_COOLDOWN     = 3
+SEARCH_EV_THRESHOLD = 1.5    # only search when EV exceeds this (was 0)
+TIME_BUFFER         = 2.0
 HISTORY_LEN         = 6
 
+# Directions for scanning primed runs
+_DIRS = [(1, 0), (0, 1)]  # horizontal and vertical only (avoid double-counting)
 _FOUR_DIRS = [(1, 0), (-1, 0), (0, 1), (0, -1)]
 
 
 class PlayerAgent:
     """
     Iterative-deepening Alpha-Beta with HMM rat tracking.
-    Based on v4 (4-1 vs George) with targeted fixes:
-    - No rat searching first 18 turns
-    - Higher search threshold (p > 0.83)
-    - Longer search cooldown
-    - Safe time buffer (5s)
-    - Length-1 carpet deprioritized
+    v4: root-only oscillation, higher search threshold,
+        global distance-weighted carpet potential, adaptive time mgmt.
     """
 
     def __init__(self, board, transition_matrix=None, time_left: Callable = None):
@@ -47,7 +45,7 @@ class PlayerAgent:
         self.search_cooldown = 0
 
     def commentate(self):
-        return "ID Alpha-Beta + HMM v4.1"
+        return "ID Alpha-Beta + HMM v4"
 
     def play(self, board, sensor_data: Tuple, time_left: Callable):
         noise, est_d = sensor_data
@@ -56,13 +54,14 @@ class PlayerAgent:
         self.hmm.update(board, noise, est_d, my_pos, board.opponent_search)
         self.search_cooldown = max(0, self.search_cooldown - 1)
 
-        best_idx, _ = self.hmm.get_best_guess()
+        best_idx, best_p = self.hmm.get_best_guess()
         turns_left = board.player_worker.turns_left
         turns_used = 40 - turns_left
 
-        # Rat search — very selective, never early
-        if (self.hmm.search_ev(best_idx) > SEARCH_EV_THRESHOLD
-                and turns_used >= NO_SEARCH_TURNS
+        # --- Rat search: only when EV is high enough ---
+        search_ev = self.hmm.search_ev(best_idx)
+        if (search_ev > SEARCH_EV_THRESHOLD
+                and turns_used >= 4
                 and self.search_cooldown == 0):
             self.search_cooldown = SEARCH_COOLDOWN
             self.pos_history.append(my_pos)
@@ -71,6 +70,7 @@ class PlayerAgent:
 
         valid_moves = board.get_valid_moves(enemy=False, exclude_search=True)
         if not valid_moves:
+            # No movement possible — forced to search
             if self.search_cooldown == 0:
                 self.search_cooldown = SEARCH_COOLDOWN
             self.pos_history.append(my_pos)
@@ -79,14 +79,18 @@ class PlayerAgent:
 
         valid_moves = self._order_moves(valid_moves)
 
-        # Time management — safe
+        # --- Adaptive time management ---
         available = time_left() - TIME_BUFFER
-        if available < 1.0:
-            self.pos_history.append(my_pos)
-            return valid_moves[0]
-
         time_per_turn = available / max(turns_left, 1)
-        turn_budget = min(time_per_turn * 0.85, 6.0)
+
+        # Spend more in the opening (territory) and endgame (close scores)
+        if turns_used < 10:
+            budget_mult = 1.15
+        elif turns_left <= 8:
+            budget_mult = 1.25
+        else:
+            budget_mult = 1.0
+        turn_budget = min(time_per_turn * budget_mult, 8.0)
         deadline = time_left() - turn_budget
 
         best_move = valid_moves[0]
@@ -101,6 +105,10 @@ class PlayerAgent:
 
         self.pos_history.append(my_pos)
         return best_move
+
+    # ------------------------------------------------------------------
+    # Alpha-Beta search
+    # ------------------------------------------------------------------
 
     def _search_root(self, board, moves, depth, time_left, deadline):
         best_move = None
@@ -118,7 +126,7 @@ class PlayerAgent:
             if score is None:
                 return None
 
-            # Oscillation penalty at root only
+            # --- Oscillation penalty applied at root only ---
             dest = child.player_worker.get_location()
             score += self._oscillation_penalty(dest)
 
@@ -130,6 +138,7 @@ class PlayerAgent:
         return best_move
 
     def _oscillation_penalty(self, dest):
+        """Penalise moves that return to recent positions."""
         penalty = 0.0
         hist = list(self.pos_history)
         if len(hist) >= 2 and dest == hist[-2]:
@@ -203,56 +212,75 @@ class PlayerAgent:
         board.reverse_perspective()
         return worst
 
+    # ------------------------------------------------------------------
+    # Move ordering
+    # ------------------------------------------------------------------
+
     def _order_moves(self, moves):
         def priority(m):
             if m.move_type == MoveType.CARPET:
-                pts = CARPET_POINTS_TABLE.get(m.roll_length, 0)
-                if pts <= 0:
-                    return (3, 0)  # fix: length-1 carpet (-1 pts) worse than plain
-                return (0, -pts)
+                return (0, -CARPET_POINTS_TABLE.get(m.roll_length, 0))
             elif m.move_type == MoveType.PRIME:
                 return (1, 0)
             else:
                 return (2, 0)
         return sorted(moves, key=priority)
 
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
+
     def _evaluate(self, board):
         my_pts   = board.player_worker.get_points()
         opp_pts  = board.opponent_worker.get_points()
         turns_left = board.player_worker.turns_left
 
-        late_game = turns_left <= 20
-        score = (2.0 if late_game else 1.0) * float(my_pts - opp_pts)
+        late_game = turns_left <= 15
+        score = (2.5 if late_game else 1.0) * float(my_pts - opp_pts)
 
         my_pos  = board.player_worker.get_location()
         opp_pos = board.opponent_worker.get_location()
 
-        if not late_game:
-            carpet_w = W_CARPET_POTENTIAL * (turns_left / 40.0 + 0.5)
-            my_cp  = self._carpet_potential(board, my_pos)
-            opp_cp = self._carpet_potential(board, opp_pos)
-            score += carpet_w * (my_cp - opp_cp)
+        # --- Global distance-weighted carpet potential ---
+        carpet_w = W_CARPET_POTENTIAL * (turns_left / 40.0 + 0.5)
+        my_cp  = self._global_carpet_potential(board, my_pos)
+        opp_cp = self._global_carpet_potential(board, opp_pos)
+        score += carpet_w * (my_cp - opp_cp)
 
-        if self.search_cooldown == 0 and turns_left <= 22:
+        # --- Rat EV (only if not on cooldown) ---
+        if self.search_cooldown == 0:
             best_idx, _ = self.hmm.get_best_guess()
             score += W_RAT_EV * max(self.hmm.search_ev(best_idx), 0.0)
 
+        # --- Adjacent primed squares ---
         my_p  = self._adjacent_primed(board, my_pos)
         opp_p = self._adjacent_primed(board, opp_pos)
         score += W_PRIMED_OWNED * (my_p - opp_p)
 
+        # --- Mobility ---
         my_mv  = len(board.get_valid_moves(enemy=False, exclude_search=True))
         opp_mv = len(board.get_valid_moves(enemy=True,  exclude_search=True))
         score += W_MOBILITY * (my_mv - opp_mv)
 
         return score
 
-    def _carpet_potential(self, board, pos):
+    # ------------------------------------------------------------------
+    # Heuristic helpers
+    # ------------------------------------------------------------------
+
+    def _global_carpet_potential(self, board, pos):
+        """
+        Score all primed runs on the board, discounted by manhattan distance
+        from pos to the approach cell (the cell just before the run starts).
+        Also includes immediate adjacent carpet potential at full weight.
+        """
         total = 0.0
-        x, y = pos
+        px, py = pos
+
+        # Immediate adjacent runs (full weight, like before)
         for dx, dy in _FOUR_DIRS:
             run = 0
-            nx, ny = x + dx, y + dy
+            nx, ny = px + dx, py + dy
             while 0 <= nx < 8 and 0 <= ny < 8:
                 if board.get_cell((nx, ny)) == Cell.PRIMED:
                     run += 1
@@ -262,6 +290,42 @@ class PlayerAgent:
                     break
             if run > 0:
                 total += CARPET_POINTS_TABLE.get(run, 0)
+
+        # Global scan: find all primed runs, discount by distance
+        visited = set()
+        for sy in range(8):
+            for sx in range(8):
+                if board.get_cell((sx, sy)) != Cell.PRIMED:
+                    continue
+                for dx, dy in _DIRS:
+                    start = (sx, sy)
+                    if (start, dx, dy) in visited:
+                        continue
+                    # Walk the run
+                    run_len = 0
+                    nx, ny = sx, sy
+                    while 0 <= nx < 8 and 0 <= ny < 8 and board.get_cell((nx, ny)) == Cell.PRIMED:
+                        visited.add(((nx, ny), dx, dy))
+                        run_len += 1
+                        nx += dx
+                        ny += dy
+                    if run_len < 2:
+                        continue
+                    pts = CARPET_POINTS_TABLE.get(run_len, 0)
+                    if pts <= 0:
+                        continue
+                    # Approach cell: one step before the run start
+                    ax, ay = sx - dx, sy - dy
+                    if 0 <= ax < 8 and 0 <= ay < 8:
+                        dist = abs(px - ax) + abs(py - ay)
+                    else:
+                        # Approach from the other end
+                        ex, ey = sx + run_len * dx, sy + run_len * dy
+                        dist = abs(px - ex) + abs(py - ey)
+                    # Discount: nearby runs worth more
+                    if dist > 0:
+                        total += pts / (1.0 + dist * 0.5)
+
         return total
 
     def _adjacent_primed(self, board, pos):
