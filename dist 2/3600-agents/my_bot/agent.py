@@ -10,10 +10,11 @@ from .rat_belief import RatBelief
 # ---------------------------------------------------------------------------
 # Tunable weights (v4 base + targeted fixes)
 # ---------------------------------------------------------------------------
-W_CARPET_POTENTIAL  = 1.4
+W_CARPET_POTENTIAL  = 1.6
 W_RAT_EV            = 0.4
 W_PRIMED_OWNED      = 0.3
 W_MOBILITY          = 0.1
+W_ON_PRIMEABLE      = 1.5    # bumped hard: was 0.5, need to stop plain moves
 
 # Oscillation (applied at root only)
 W_OSCILLATION       = 25.0
@@ -21,10 +22,10 @@ W_OSCILLATION_2     = 18.0
 W_OSCILLATION_3     = 10.0
 W_REVISIT           = 5.0
 
-SEARCH_COOLDOWN     = 5      # fix: was 3, longer cooldown
-SEARCH_EV_THRESHOLD = 3.0    # fix: was 0, only search when very confident
-NO_SEARCH_TURNS     = 18     # fix: no searching first 18 turns
-TIME_BUFFER         = 5.0    # fix: was 2.0, safe buffer
+SEARCH_COOLDOWN     = 5      # bumped: was 4, space out searches more
+SEARCH_EV_THRESHOLD = 2.8    # bumped: was 2.5, cut ~10 searches/game to ~6-7
+NO_SEARCH_TURNS     = 10
+TIME_BUFFER         = 5.0
 HISTORY_LEN         = 6
 
 _FOUR_DIRS = [(1, 0), (-1, 0), (0, 1), (0, -1)]
@@ -32,13 +33,11 @@ _FOUR_DIRS = [(1, 0), (-1, 0), (0, 1), (0, -1)]
 
 class PlayerAgent:
     """
-    Iterative-deepening Alpha-Beta with HMM rat tracking.
-    Based on v4 (4-1 vs George) with targeted fixes:
-    - No rat searching first 18 turns
-    - Higher search threshold (p > 0.83)
-    - Longer search cooldown
-    - Safe time buffer (5s)
-    - Length-1 carpet deprioritized
+    Iterative-deepening Alpha-Beta with HMM rat tracking. v4.2
+    - Search threshold p>0.67, allowed after turn 10
+    - Priming strongly preferred over plain moves
+    - Carpet potential skips length-1 runs
+    - Bonus for standing on primeable space
     """
 
     def __init__(self, board, transition_matrix=None, time_left: Callable = None):
@@ -47,7 +46,7 @@ class PlayerAgent:
         self.search_cooldown = 0
 
     def commentate(self):
-        return "ID Alpha-Beta + HMM v4.1"
+        return "ID Alpha-Beta + HMM v4.4"
 
     def play(self, board, sensor_data: Tuple, time_left: Callable):
         noise, est_d = sensor_data
@@ -227,20 +226,31 @@ class PlayerAgent:
         my_pos  = board.player_worker.get_location()
         opp_pos = board.opponent_worker.get_location()
 
-        if not late_game:
-            carpet_w = W_CARPET_POTENTIAL * (turns_left / 40.0 + 0.5)
-            my_cp  = self._carpet_potential(board, my_pos)
-            opp_cp = self._carpet_potential(board, opp_pos)
-            score += carpet_w * (my_cp - opp_cp)
+        # Carpet potential — always active, scaled by time remaining
+        carpet_w = W_CARPET_POTENTIAL * (turns_left / 40.0 + 0.5)
+        my_cp  = self._carpet_potential(board, my_pos)
+        opp_cp = self._carpet_potential(board, opp_pos)
+        score += carpet_w * (my_cp - opp_cp)
 
-        if self.search_cooldown == 0 and turns_left <= 22:
+        # Bonus for standing on a primeable space (encourages priming over plain)
+        my_cell = board.get_cell(my_pos)
+        opp_cell = board.get_cell(opp_pos)
+        if my_cell == Cell.SPACE:
+            score += W_ON_PRIMEABLE
+        if opp_cell == Cell.SPACE:
+            score -= W_ON_PRIMEABLE
+
+        # Rat EV
+        if self.search_cooldown == 0 and turns_left <= 30:
             best_idx, _ = self.hmm.get_best_guess()
             score += W_RAT_EV * max(self.hmm.search_ev(best_idx), 0.0)
 
+        # Adjacent primed
         my_p  = self._adjacent_primed(board, my_pos)
         opp_p = self._adjacent_primed(board, opp_pos)
         score += W_PRIMED_OWNED * (my_p - opp_p)
 
+        # Mobility
         my_mv  = len(board.get_valid_moves(enemy=False, exclude_search=True))
         opp_mv = len(board.get_valid_moves(enemy=True,  exclude_search=True))
         score += W_MOBILITY * (my_mv - opp_mv)
@@ -248,6 +258,7 @@ class PlayerAgent:
         return score
 
     def _carpet_potential(self, board, pos):
+        """Score carpet runs adjacent to pos. Skip length-1 (they're -1 pts)."""
         total = 0.0
         x, y = pos
         for dx, dy in _FOUR_DIRS:
@@ -260,7 +271,7 @@ class PlayerAgent:
                     ny += dy
                 else:
                     break
-            if run > 0:
+            if run >= 2:  # skip length-1 (-1 pts)
                 total += CARPET_POINTS_TABLE.get(run, 0)
         return total
 
