@@ -3,59 +3,49 @@ from typing import List, Tuple
 from collections import deque
 
 from game import board, move, enums
-from game.enums import Cell, CARPET_POINTS_TABLE, MoveType, Direction, loc_after_direction
+from game.enums import Cell, CARPET_POINTS_TABLE, MoveType
 from .rat_belief import RatBelief
 
-
 # ---------------------------------------------------------------------------
-# Tunable weights
+# Weights
 # ---------------------------------------------------------------------------
-W_CARPET_POTENTIAL  = 2.0
-W_PRIME_EXTEND      = 1.0
-W_PRIMED_OWNED      = 0.2
-W_MOBILITY          = 0.05
-W_RAT_EV            = 0.3
-W_ON_SPACE          = 0.4
+W_CARPET_POTENTIAL  = 1.6
+W_RAT_EV            = 0.4
+W_PRIMED_OWNED      = 0.3
+W_MOBILITY          = 0.1
+W_ON_PRIMEABLE      = 0.8
 
-# Oscillation (root only)
 W_OSCILLATION       = 25.0
 W_OSCILLATION_2     = 18.0
 W_OSCILLATION_3     = 10.0
 W_REVISIT           = 5.0
 
-SEARCH_COOLDOWN     = 5
-SEARCH_EV_THRESHOLD = 3.0
-NO_SEARCH_TURNS     = 18
-TIME_BUFFER         = 5.0
-HISTORY_LEN         = 6
+SEARCH_COOLDOWN        = 4
+SEARCH_EV_THRESHOLD    = 0.2
+NO_SEARCH_TURNS        = 8
+FORCED_SEARCH_INTERVAL = 8
 
-# Expectiminimax: how many top opponent moves to consider in chance node
-MAX_OPP_MOVES       = 5
+TIME_BUFFER = 5.0
+HISTORY_LEN = 6
+MAX_OPP_MOVES = 3  # top-K opponent moves for chance node
 
 _FOUR_DIRS = [(1, 0), (-1, 0), (0, 1), (0, -1)]
 
 
 class PlayerAgent:
     """
-    Iterative-deepening Expectiminimax with HMM rat tracking.
-
-    Instead of assuming the opponent plays the worst-case move (minimax),
-    we model the opponent's move as a chance node: we take the top-K
-    opponent moves (by a quick heuristic score), assign them weights
-    proportional to their quality, and compute the weighted average.
-
-    This better handles the stochastic nature of the game — the opponent
-    won't always find the optimal counter-move, and board randomness
-    means worst-case analysis is overly pessimistic.
+    Expectiminimax with HMM. Opponent modeled as chance node
+    averaging top-3 moves. Same heuristic as v5.3.
     """
 
     def __init__(self, board, transition_matrix=None, time_left: Callable = None):
         self.hmm = RatBelief(transition_matrix)
         self.pos_history = deque(maxlen=HISTORY_LEN)
         self.search_cooldown = 0
+        self.turns_since_search = 0
 
     def commentate(self):
-        return "Expectiminimax + HMM v1"
+        return "AKIR-EXPECTIMAX-v1"
 
     def play(self, board, sensor_data: Tuple, time_left: Callable):
         noise, est_d = sensor_data
@@ -64,43 +54,49 @@ class PlayerAgent:
         self.hmm.update(board, noise, est_d, my_pos, board.opponent_search)
         self.search_cooldown = max(0, self.search_cooldown - 1)
 
-        best_idx, best_p = self.hmm.get_best_guess()
+        best_idx, _ = self.hmm.get_best_guess()
         turns_left = board.player_worker.turns_left
         turns_used = 40 - turns_left
+        self.turns_since_search += 1
 
-        # --- Rat search: very selective ---
+        # --- Rat search ---
         search_ev = self.hmm.search_ev(best_idx)
-        if (search_ev > SEARCH_EV_THRESHOLD
-                and turns_used >= NO_SEARCH_TURNS
-                and self.search_cooldown == 0):
+        want_search = False
+        if turns_used >= NO_SEARCH_TURNS and self.search_cooldown == 0:
+            if search_ev > SEARCH_EV_THRESHOLD:
+                want_search = True
+            elif self.turns_since_search >= FORCED_SEARCH_INTERVAL:
+                want_search = True
+        if want_search:
             self.search_cooldown = SEARCH_COOLDOWN
+            self.turns_since_search = 0
             self.pos_history.append(my_pos)
             x, y = best_idx % 8, best_idx // 8
             return move.Move.search((x, y))
 
+        # --- Movement ---
         valid_moves = board.get_valid_moves(enemy=False, exclude_search=True)
         if not valid_moves:
-            if self.search_cooldown == 0:
-                self.search_cooldown = SEARCH_COOLDOWN
+            self.search_cooldown = max(self.search_cooldown, SEARCH_COOLDOWN)
+            self.turns_since_search = 0
             self.pos_history.append(my_pos)
             x, y = best_idx % 8, best_idx // 8
             return move.Move.search((x, y))
 
         valid_moves = self._order_moves(valid_moves)
 
-        # --- Time management ---
         available = time_left() - TIME_BUFFER
         if available < 1.0:
             self.pos_history.append(my_pos)
             return valid_moves[0]
 
         time_per_turn = available / max(turns_left, 1)
-        turn_budget = min(time_per_turn * 0.9, 6.0)
+        turn_budget = min(time_per_turn * 0.85, 6.0)
         deadline = time_left() - turn_budget
 
         best_move = valid_moves[0]
         for depth in range(2, 30):
-            if time_left() < deadline + 0.1:
+            if time_left() < deadline + 0.05:
                 break
             result = self._search_root(board, valid_moves, depth, time_left, deadline)
             if result is not None:
@@ -128,19 +124,14 @@ class PlayerAgent:
             score = self._chance_node(child, depth - 1, time_left, deadline)
             if score is None:
                 return None
-
-            # Oscillation penalty at root
             dest = child.player_worker.get_location()
             score += self._oscillation_penalty(dest)
-
             if score > best_score:
                 best_score = score
                 best_move = m
-
         return best_move
 
     def _max_node(self, board, depth, time_left, deadline):
-        """Our turn: pick the move that maximizes score."""
         if time_left() < deadline:
             return None
         if depth == 0:
@@ -165,17 +156,9 @@ class PlayerAgent:
 
     def _chance_node(self, board, depth, time_left, deadline):
         """
-        Opponent's turn modeled as a chance node.
-
-        Instead of pure min (assuming optimal opponent), we:
-        1. Get opponent's valid moves
-        2. Quick-score each move for the opponent
-        3. Take the top-K moves
-        4. Weight them by softmax of their quick scores
-        5. Return the weighted average of the resulting states
-
-        This is the key difference from minimax — it models the opponent
-        as "probably good but not perfect", which better matches reality.
+        Opponent's turn as a chance node.
+        Get opponent moves, order them (best for opponent first),
+        take top-K, average their outcomes equally.
         """
         if time_left() < deadline:
             return None
@@ -189,38 +172,19 @@ class PlayerAgent:
             board.reverse_perspective()
             return self._evaluate(board)
 
-        # Quick-score each opponent move (from opponent's perspective)
-        scored = []
-        for m in opp_moves:
-            scored.append((self._quick_score_move(board, m), m))
-
-        # Sort by score descending (best for opponent first)
-        scored.sort(key=lambda x: -x[0])
+        # Order moves (best for opponent = carpet first)
+        opp_moves = self._order_moves(opp_moves)
 
         # Take top-K
-        top_moves = scored[:MAX_OPP_MOVES]
+        top = opp_moves[:MAX_OPP_MOVES]
 
-        # Compute weights via softmax-like weighting
-        # Higher-scored moves get more weight
-        scores_list = [s for s, _ in top_moves]
-        max_s = scores_list[0]
-        weights = []
-        for s in scores_list:
-            # Simple exponential weighting, clamped to avoid overflow
-            w = 2.718 ** min(s - max_s + 2.0, 5.0)  # shift so best = e^2
-            weights.append(w)
-        total_w = sum(weights)
-        if total_w < 1e-9:
-            weights = [1.0] * len(top_moves)
-            total_w = len(top_moves)
-
-        # Weighted average of child values
-        weighted_sum = 0.0
-        for i, (_, m) in enumerate(top_moves):
+        total = 0.0
+        count = 0
+        for em in top:
             if time_left() < deadline:
                 board.reverse_perspective()
                 return None
-            child = board.forecast_move(m, check_ok=False)
+            child = board.forecast_move(em, check_ok=False)
             if child is None:
                 continue
             child.reverse_perspective()
@@ -228,26 +192,14 @@ class PlayerAgent:
             if val is None:
                 board.reverse_perspective()
                 return None
-            weighted_sum += (weights[i] / total_w) * val
+            total += val
+            count += 1
 
         board.reverse_perspective()
-        return weighted_sum
-
-    def _quick_score_move(self, board, m):
-        """
-        Fast heuristic score for an opponent move (from their perspective).
-        Used to weight the chance node — no deep search, just immediate value.
-        """
-        if m.move_type == MoveType.CARPET:
-            pts = CARPET_POINTS_TABLE.get(m.roll_length, 0)
-            return pts + 5.0  # carpet moves are generally strong
-        elif m.move_type == MoveType.PRIME:
-            return 2.0  # priming is decent
-        else:
-            return 0.0  # plain moves are weak
+        return total / max(count, 1)
 
     # ------------------------------------------------------------------
-    # Oscillation penalty
+    # Helpers
     # ------------------------------------------------------------------
 
     def _oscillation_penalty(self, dest):
@@ -264,10 +216,6 @@ class PlayerAgent:
             penalty -= W_REVISIT * revisit_count
         return penalty
 
-    # ------------------------------------------------------------------
-    # Move ordering
-    # ------------------------------------------------------------------
-
     def _order_moves(self, moves):
         def priority(m):
             if m.move_type == MoveType.CARPET:
@@ -281,59 +229,30 @@ class PlayerAgent:
                 return (2, 0)
         return sorted(moves, key=priority)
 
-    # ------------------------------------------------------------------
-    # Evaluation
-    # ------------------------------------------------------------------
-
     def _evaluate(self, board):
-        my_pts   = board.player_worker.get_points()
-        opp_pts  = board.opponent_worker.get_points()
+        my_pts = board.player_worker.get_points()
+        opp_pts = board.opponent_worker.get_points()
         turns_left = board.player_worker.turns_left
-
-        late_game = turns_left <= 12
-        score = (3.0 if late_game else 1.0) * float(my_pts - opp_pts)
-
-        my_pos  = board.player_worker.get_location()
+        late = turns_left <= 20
+        score = (2.0 if late else 1.0) * float(my_pts - opp_pts)
+        my_pos = board.player_worker.get_location()
         opp_pos = board.opponent_worker.get_location()
-
-        # Carpet potential
-        carpet_w = W_CARPET_POTENTIAL * (turns_left / 40.0 + 0.5)
-        my_cp  = self._carpet_potential(board, my_pos)
-        opp_cp = self._carpet_potential(board, opp_pos)
-        score += carpet_w * (my_cp - opp_cp)
-
-        # Prime extension value
-        ext_w = W_PRIME_EXTEND * (turns_left / 40.0 + 0.3)
-        my_ext  = self._prime_extend_value(board, my_pos)
-        opp_ext = self._prime_extend_value(board, opp_pos)
-        score += ext_w * (my_ext - opp_ext)
-
-        # Space bonus
+        cw = W_CARPET_POTENTIAL * (turns_left / 40.0 + 0.5)
+        score += cw * (self._carpet_potential(board, my_pos)
+                       - self._carpet_potential(board, opp_pos))
         if board.get_cell(my_pos) == Cell.SPACE:
-            score += W_ON_SPACE
+            score += W_ON_PRIMEABLE
         if board.get_cell(opp_pos) == Cell.SPACE:
-            score -= W_ON_SPACE
-
-        # Adjacent primed
-        my_p  = self._adjacent_primed(board, my_pos)
-        opp_p = self._adjacent_primed(board, opp_pos)
-        score += W_PRIMED_OWNED * (my_p - opp_p)
-
-        # Mobility
-        my_mv  = len(board.get_valid_moves(enemy=False, exclude_search=True))
-        opp_mv = len(board.get_valid_moves(enemy=True,  exclude_search=True))
-        score += W_MOBILITY * (my_mv - opp_mv)
-
-        # Rat EV
-        if self.search_cooldown == 0 and turns_left <= 22:
+            score -= W_ON_PRIMEABLE
+        if self.search_cooldown == 0 and turns_left <= 30:
             best_idx, _ = self.hmm.get_best_guess()
             score += W_RAT_EV * max(self.hmm.search_ev(best_idx), 0.0)
-
+        score += W_PRIMED_OWNED * (self._adjacent_primed(board, my_pos)
+                                   - self._adjacent_primed(board, opp_pos))
+        my_mv = len(board.get_valid_moves(enemy=False, exclude_search=True))
+        opp_mv = len(board.get_valid_moves(enemy=True, exclude_search=True))
+        score += W_MOBILITY * (my_mv - opp_mv)
         return score
-
-    # ------------------------------------------------------------------
-    # Heuristic helpers
-    # ------------------------------------------------------------------
 
     def _carpet_potential(self, board, pos):
         total = 0.0
@@ -351,31 +270,6 @@ class PlayerAgent:
             if run >= 2:
                 total += CARPET_POINTS_TABLE.get(run, 0)
         return total
-
-    def _prime_extend_value(self, board, pos):
-        x, y = pos
-        if board.get_cell((x, y)) != Cell.SPACE:
-            return 0.0
-        best = 0.0
-        for dx, dy in [(1, 0), (0, 1)]:
-            behind = 0
-            bx, by = x - dx, y - dy
-            while 0 <= bx < 8 and 0 <= by < 8 and board.get_cell((bx, by)) == Cell.PRIMED:
-                behind += 1
-                bx -= dx
-                by -= dy
-            ahead = 0
-            fx, fy = x + dx, y + dy
-            while 0 <= fx < 8 and 0 <= fy < 8 and board.get_cell((fx, fy)) == Cell.PRIMED:
-                ahead += 1
-                fx += dx
-                fy += dy
-            total_line = behind + 1 + ahead
-            if total_line >= 3:
-                pts = CARPET_POINTS_TABLE.get(min(total_line, 7), 0)
-                if pts > best:
-                    best = pts
-        return best
 
     def _adjacent_primed(self, board, pos):
         x, y = pos
